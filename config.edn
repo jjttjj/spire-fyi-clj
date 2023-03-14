@@ -1,0 +1,435 @@
+{:aws/bucket "bucket"
+ :data-path  "data"
+ :queries
+ [{:query/id              "sdk_new_users_sol",
+   :query/type            :flipside,
+   :query/col-names       ["ADDRESS" "CREATION_DATE"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:date},
+   :query/template
+   "-- Note: didn't change this yet but think i can remove all but the first block
+WITH solana_wallets AS (
+    SELECT
+        signers [0] AS address,
+        MIN(DATE(block_timestamp)) AS creation_date,
+        MAX(DATE(block_timestamp)) AS last_use
+    FROM
+        solana.core.fact_transactions
+    GROUP BY
+        address
+),
+solana_new_wallets AS (
+    SELECT
+        address,
+        creation_date,
+        last_use
+    FROM
+        solana_wallets
+    WHERE
+        creation_date = {{ date }}
+)
+SELECT
+    *
+FROM
+    solana_new_wallets
+"}
+  {:query/id              "sdk_programs_new_users_sol",
+   :query/type            :flipside,
+   :query/col-names       ["Date" "PROGRAM_ID" "TX_COUNT" "SIGNERS"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "WITH solana_wallets AS (
+    SELECT
+        signers [0] AS address,
+        MIN(DATE(block_timestamp)) AS creation_date
+    FROM
+        solana.core.fact_transactions
+    GROUP BY
+        address
+),
+solana_new_wallets AS (
+    SELECT
+        address,
+        creation_date
+    FROM
+        solana_wallets
+    WHERE
+        creation_date BETWEEN {{ t1 }} AND {{ t2 }}
+)
+SELECT
+    e.block_timestamp :: DATE AS \"Date\",
+    e.program_id,
+    COUNT(DISTINCT e.tx_id) AS tx_count,
+    COUNT(DISTINCT t.signers [0]) AS signers
+FROM
+    solana.core.fact_events e
+    JOIN solana.core.fact_transactions t
+    ON (
+        e.tx_id = t.tx_id
+        AND e.block_timestamp :: DATE = t.block_timestamp :: DATE
+    )
+WHERE
+    e.block_timestamp :: DATE BETWEEN {{ t1 }} AND {{ t2 }}
+    AND t.signers [0] IN (
+        SELECT
+            address
+        FROM
+            solana_new_wallets
+    )
+GROUP BY
+    program_id,
+    \"Date\"
+ORDER BY
+    signers
+"}
+  {:query/id              "sdk_programs_sol",
+   :query/type            :flipside,
+   :query/col-names       ["Date" "PROGRAM_ID" "TX_COUNT" "SIGNERS"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "SELECT
+    e.block_timestamp :: DATE AS \"Date\",
+    e.program_id,
+    COUNT(
+        DISTINCT e.tx_id
+    ) AS tx_count,
+    COUNT(
+        DISTINCT t.signers [0]
+    ) AS signers
+FROM
+    solana.core.fact_events e
+    JOIN solana.core.fact_transactions t
+    ON (
+        e.tx_id = t.tx_id
+        AND e.block_timestamp :: DATE = t.block_timestamp :: DATE
+    )
+WHERE
+    e.block_timestamp :: DATE BETWEEN {{ t1 }} AND {{ t2 }}
+GROUP BY
+    program_id,
+    \"Date\"
+ORDER BY
+    signers
+"}
+  {:query/id              "sdk_transactions_sol",
+   :query/type            :flipside,
+   :query/col-names
+   ["DATETIME" "TOTAL_TX" "TOTAL_FEE" "AVG_TOTAL_FEE"
+    "TOTAL_COMPUTE_UNITS_USED" "TOTAL_AVG_COMPUTE_UNITS_USED"
+    "TOTAL_AVG_COMPUTE_UNITS_REQUESTED" "TOTAL_AVG_COMPUTE_UNITS_PROPORTION"
+    "SUCCESSFUL_TX" "SUCCESSFUL_FEE" "AVG_SUCCESSFUL_FEE"
+    "SUCCESSFUL_COMPUTE_UNITS_USED" "AVG_SUCCESSFUL_COMPUTE_UNITS_USED"
+    "AVG_SUCCESSFUL_COMPUTE_UNITS_REQUESTED"
+    "AVG_SUCCESSFUL_COMPUTE_UNITS_PROPORTION" "FAILED_TX" "FAILED_FEE"
+    "AVG_FAILED_FEE" "FAILED_COMPUTE_UNITS_USED"
+    "AVG_FAILED_COMPUTE_UNITS_USED" "AVG_FAILED_COMPUTE_UNITS_REQUESTED"
+    "AVG_FAILED_COMPUTE_UNITS_PROPORTION" "SUCCESS_RATE" "TOTAL_TPS"
+    "SUCCESFUL_TPS" "FAILED_TPS"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "WITH consumption_tx AS (
+    SELECT
+        t.block_timestamp,
+        t.tx_id,
+        t.fee,
+        t.succeeded,
+        SUM(
+            SPLIT(
+                REGEXP_SUBSTR(
+                    s.value,
+                    '[0-9]* of [0-9]*'
+                ),
+                ' of '
+            ) [0] :: INT
+        ) AS compute_units_used,
+        AVG(
+            SPLIT(
+                REGEXP_SUBSTR(
+                    s.value,
+                    '[0-9]* of [0-9]*'
+                ),
+                ' of '
+            ) [1] :: INT
+        ) AS avg_compute_units_requested,
+        AVG(
+            CASE
+                WHEN SPLIT(
+                    REGEXP_SUBSTR(
+                        s.value,
+                        '[0-9]* of [0-9]*'
+                    ),
+                    ' of '
+                ) [1] :: INT = 0 THEN NULL
+                ELSE SPLIT(
+                    REGEXP_SUBSTR(
+                        s.value,
+                        '[0-9]* of [0-9]*'
+                    ),
+                    ' of '
+                ) [0] :: INT / SPLIT(
+                    REGEXP_SUBSTR(
+                        s.value,
+                        '[0-9]* of [0-9]*'
+                    ),
+                    ' of '
+                ) [1] :: INT
+            END
+        ) AS avg_compute_units_proportion
+    FROM
+        solana.core.fact_transactions t,
+        LATERAL FLATTEN(
+            input => t.log_messages
+        ) s
+    WHERE
+        block_timestamp :: DATE BETWEEN {{ t1 }} AND {{ t2 }}
+        AND s.value LIKE '% consumed %'
+    GROUP BY
+        t.block_timestamp,
+        t.tx_id,
+        t.fee,
+        t.succeeded
+)
+SELECT
+    DATE_TRUNC(
+        'hour',
+        block_timestamp
+    ) AS datetime,
+    -- total tx
+    COUNT(tx_id) AS total_tx,
+    SUM(fee) AS total_fee,
+    AVG(fee) AS avg_total_fee,
+    SUM(compute_units_used) AS total_compute_units_used,
+    AVG(compute_units_used) AS total_avg_compute_units_used,
+    AVG(avg_compute_units_requested) AS total_avg_compute_units_requested,
+    AVG(avg_compute_units_proportion) AS total_avg_compute_units_proportion,
+    -- successful tx:
+    COUNT(
+        CASE
+            WHEN succeeded = 'TRUE' THEN succeeded
+            ELSE NULL
+        END
+    ) AS successful_tx,
+    SUM(
+        CASE
+            WHEN succeeded = 'TRUE' THEN fee
+            ELSE NULL
+        END
+    ) AS successful_fee,
+    AVG(
+        CASE
+            WHEN succeeded = 'TRUE' THEN fee
+            ELSE NULL
+        END
+    ) AS avg_successful_fee,
+    SUM(
+        CASE
+            WHEN succeeded = 'TRUE' THEN compute_units_used
+            ELSE NULL
+        END
+    ) AS successful_compute_units_used,
+    AVG(
+        CASE
+            WHEN succeeded = 'TRUE' THEN compute_units_used
+            ELSE NULL
+        END
+    ) AS avg_successful_compute_units_used,
+    AVG(
+        CASE
+            WHEN succeeded = 'TRUE' THEN avg_compute_units_requested
+            ELSE NULL
+        END
+    ) AS avg_successful_compute_units_requested,
+    AVG(
+        CASE
+            WHEN succeeded = 'TRUE' THEN avg_compute_units_proportion
+            ELSE NULL
+        END
+    ) AS avg_successful_compute_units_proportion,
+    -- failed tx:
+    COUNT(
+        CASE
+            WHEN succeeded = 'FALSE' THEN succeeded
+            ELSE NULL
+        END
+    ) AS failed_tx,
+    SUM(
+        CASE
+            WHEN succeeded = 'FALSE' THEN fee
+            ELSE NULL
+        END
+    ) AS failed_fee,
+    AVG(
+        CASE
+            WHEN succeeded = 'FALSE' THEN fee
+            ELSE NULL
+        END
+    ) AS avg_failed_fee,
+    SUM(
+        CASE
+            WHEN succeeded = 'FALSE' THEN compute_units_used
+            ELSE NULL
+        END
+    ) AS failed_compute_units_used,
+    AVG(
+        CASE
+            WHEN succeeded = 'FALSE' THEN compute_units_used
+            ELSE NULL
+        END
+    ) AS avg_failed_compute_units_used,
+    AVG(
+        CASE
+            WHEN succeeded = 'FALSE' THEN avg_compute_units_requested
+            ELSE NULL
+        END
+    ) AS avg_failed_compute_units_requested,
+    AVG(
+        CASE
+            WHEN succeeded = 'FALSE' THEN avg_compute_units_proportion
+            ELSE NULL
+        END
+    ) AS avg_failed_compute_units_proportion,
+    -- rates:
+    CASE
+        WHEN total_tx = 0 THEN NULL
+        ELSE successful_tx / total_tx
+    END AS success_rate,
+    total_tx / 3600 AS total_tps,
+    successful_tx / 3600 AS succesful_tps,
+    failed_tx / 3600 AS failed_tps
+FROM
+    consumption_tx
+GROUP BY
+    datetime
+ORDER BY
+    datetime
+"}
+  {:query/id              "sdk_weekly_new_program_count_sol",
+   :query/type            :flipside,
+   :query/col-names       ["WEEK" "New Programs"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "WITH first_program_tx AS (
+    SELECT
+        program_id,
+        MIN(
+            DATE_TRUNC(
+                week,
+                block_timestamp
+            )
+        ) AS program_first_tx
+    FROM
+        solana.core.fact_events
+    WHERE
+        succeeded = 'TRUE'
+    GROUP BY
+        program_id
+),
+new_programs AS (
+    SELECT
+        program_first_tx AS week,
+        COUNT(
+            DISTINCT program_id
+        ) AS \"New Programs\"
+    FROM
+        first_program_tx
+    WHERE
+        week BETWEEN {{ t1 }} AND {{ t2 }}
+    GROUP BY
+        week
+)
+SELECT
+    *
+FROM
+    new_programs
+"}
+  {:query/id              "sdk_weekly_new_users_sol",
+   :query/type            :flipside,
+   :query/col-names       ["NEW_USERS" "WEEK"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "WITH solana_wallets AS (
+    SELECT
+        signers [0] AS address,
+        MIN(DATE(block_timestamp)) AS creation_date
+    FROM
+        solana.core.fact_transactions
+    GROUP BY
+        address
+),
+solana_new_wallets AS (
+    SELECT
+    -- note: order switch from original 
+        DATE_TRUNC(
+            week,
+            creation_date
+        ) AS week
+        count(address) as new_users,
+        
+    FROM
+        solana_wallets
+    WHERE
+        week = BETWEEN {{ t1 }} AND {{ t2 }}
+    GROUP BY 
+        week
+)
+SELECT
+    *
+FROM
+    solana_new_wallets
+"}
+  {:query/id              "sdk_weekly_program_count_sol",
+   :query/type            :flipside,
+   :query/col-names       ["WEEK" "UNIQUE_PROGRAMS"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "SELECT
+    DATE_TRUNC(
+        week,
+        block_timestamp
+    ) AS week,
+    COUNT(
+        DISTINCT program_id
+    ) AS unique_programs
+FROM
+    solana.core.fact_events
+WHERE
+    succeeded = 'TRUE'
+    AND week BETWEEN {{ t1 }} AND {{ t2 }}
+GROUP BY
+    week
+"}
+  {:query/id              "sdk_weekly_users_sol",
+   :query/type            :flipside,
+   :query/col-names       ["WEEK" "UNIQUE_USERS"],
+   :query/schedule        {:at #time/time "09:00", :every :day},
+   :query.template/engine :jinja,
+   :query.template/args   #{:t1 :t2},
+   :query/template
+   "SELECT
+    DATE_TRUNC(
+        week,
+        block_timestamp
+    ) AS week,
+    COUNT(
+        DISTINCT signers [0]
+    ) AS unique_users
+FROM
+    solana.core.fact_transactions
+WHERE
+    week BETWEEN {{ t1 }} AND {{ t2 }}
+GROUP BY
+    week
+"}]}
